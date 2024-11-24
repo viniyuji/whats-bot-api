@@ -1,5 +1,5 @@
 chalice==1.31.2
-orjson==3.10.11
 httpx==0.27.2
-google-generativeai==0.8.3
-boto3==1.35.62
+#google-generativeai==0.8.3
+aioboto3==13.2.0
+#chalice-local==0.1.1
