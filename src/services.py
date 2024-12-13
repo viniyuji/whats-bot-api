@@ -1,12 +1,12 @@
 import aioboto3
-import httpx
-import os
-from functools import lru_cache
+from httpx import AsyncClient as HttpxClient
+from os import environ
+import asyncio
 
-GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
-AWS_ACCESS_KEY_ID = os.environ['AWS_ACCESS_KEY_ID']
-AWS_SECRET_ACCESS_KEY = os.environ['AWS_SECRET_ACCESS_KEY']
-AWS_DEFAULT_REGION = os.environ['AWS_DEFAULT_REGION']
+GEMINI_API_KEY = environ['GEMINI_API_KEY']
+AWS_ACCESS_KEY_ID = environ['AWS_ACCESS_KEY_ID']
+AWS_SECRET_ACCESS_KEY = environ['AWS_SECRET_ACCESS_KEY']
+AWS_DEFAULT_REGION = environ['AWS_DEFAULT_REGION']
 
 class DynamoDBClient:
 
@@ -14,6 +14,20 @@ class DynamoDBClient:
         self.user_phone_id = user_phone_id
         self.client_phone_number = client_phone_number
         self._chat_history = None
+        self._client = None
+
+    async def init_client(self) -> None:
+        session = aioboto3.Session()
+        self._client = await session.client(
+            'dynamodb',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_DEFAULT_REGION
+        ).__aenter__()
+
+    async def close_client(self) -> None:
+        await self._client.__aexit__(None, None, None)
+        self._client = None
 
     # @staticmethod
     # def to_dynamodb_format(data):
@@ -47,30 +61,30 @@ class DynamoDBClient:
         else:
             raise ValueError(f"Unsupported DynamoDB type: {data}")
 
-    async def get_chat_history(self) -> list:
-        async with aioboto3.Session().client(
-            'dynamodb',
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_DEFAULT_REGION
-        ) as client:
-            response = await client.get_item(
-                TableName='chat_history',
-                Key={
-                    'user_phone_id': {'S': self.user_phone_id},
-                    'client_phone_number': {'S': self.client_phone_number}
-                },
-                AttributesToGet=['history']
-            )
+    async def get_user_data(self) -> tuple[str, str]:
+        response = await self._client.get_item(
+            TableName='users',
+            Key={
+                'user_phone_id': {'S': self.user_phone_id}
+            }
+        )
+        user_input = response.get('Item', {}).get('input', {}).get('S', '')
+        whatsapp_access_token = response.get('Item', {}).get('whatsapp_access_token', {}).get('S', '')
+        return user_input, whatsapp_access_token
 
-            try:
-                result = response.get('Item').get('history').get('L')
-                self._chat_history = result
-                return [DynamoDBClient.from_dynamodb_format(element) for element in result]
-            except AttributeError as e:
-                print(e)
-                self._chat_history = []
-                return []
+    async def get_chat_history(self) -> list:
+        response = await self._client.get_item(
+            TableName='chat_history',
+            Key={
+                'user_phone_id': {'S': self.user_phone_id},
+                'client_phone_number': {'S': self.client_phone_number}
+            },
+            AttributesToGet=['history']
+        )
+
+        result = response.get('Item', {}).get('history', {}).get('L', [])
+        self._chat_history = result
+        return [DynamoDBClient.from_dynamodb_format(element) for element in result]
 
     async def save_chat_history(self, new_message: str, new_response: str) -> None:
         self._chat_history.extend(
@@ -94,54 +108,25 @@ class DynamoDBClient:
             ]
         )
 
-        async with aioboto3.Session().client(
-            'dynamodb',
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_DEFAULT_REGION
-        ) as client:
-            await client.update_item(
-                TableName='chat_history',
-                Key={
-                    'user_phone_id': {'S': self.user_phone_id},
-                    'client_phone_number': {'S': self.client_phone_number}
-                },
-                UpdateExpression="SET history = :history",
-                ExpressionAttributeValues={
-                    ':history': {'L': self._chat_history}
-                }
-            )
+        await self._client.update_item(
+            TableName='chat_history',
+            Key={
+                'user_phone_id': {'S': self.user_phone_id},
+                'client_phone_number': {'S': self.client_phone_number}
+            },
+            UpdateExpression="SET history = :history",
+            ExpressionAttributeValues={
+                ':history': {'L': self._chat_history}
+            }
+        )
 
 class WhatsAppClient:
 
     def __init__(self, user_phone_id: str, client_phone_number: str) -> None:
         self.user_phone_id = user_phone_id
         self.client_phone_number = client_phone_number
-        self._whatsapp_access_token = None
-
-    @staticmethod
-    @lru_cache()
-    async def _get_access_token(user_phone_id: str) -> str:
-        '''
-        Argument user_phone_id is used to cache the return of the method, independant of the class instance.
-        It's an optimization to avoid calling the AWS Secrets Manager API multiple times.
-        It could be an isolated function, as it's supposed to be a high order function, but it's here for the sake of organization.
-        '''
-        async with aioboto3.Session().client(
-            'secretsmanager',
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_DEFAULT_REGION
-        ) as client:
-            response = await client.get_secret_value(
-                SecretId = f'user_phone_id/{user_phone_id}'
-            )
-            return response.get('SecretString')
-        
-    async def set_access_token(self) -> None:
-        self._whatsapp_access_token = await self._get_access_token(self.user_phone_id)
-        
-    async def send_message_to_whatsapp(self, message: str) -> None:
+    
+    async def send_message_to_whatsapp(self, message: str, whatsapp_access_token: str) -> None:
         url = f"https://graph.facebook.com/v21.0/{self.user_phone_id}/messages"
 
         payload = {
@@ -157,38 +142,34 @@ class WhatsAppClient:
         
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._whatsapp_access_token}"
+            "Authorization": f"Bearer {whatsapp_access_token}"
         }
 
-        async with httpx.AsyncClient() as client:
+        async with HttpxClient() as client:
             response = await client.post(url, headers=headers, json=payload)
-
-            if response.status_code != 200:
-                raise RuntimeError(f"Failed to send message to WhatsApp. \nStatus Code: {response.status_code}. \nResponse: {response.text}")
-
-# class GeminiClient:
-
-#     @staticmethod
-#     async def send_message_to_gemini(message: str, history: list):
-#         genai.configure(api_key=GEMINI_API_KEY)
-#         model = genai.GenerativeModel("gemini-1.5-flash")
-#         chat = model.start_chat(history = history)
-#         response = await asyncio.to_thread(
-#             chat.send_message(message)
-#         )
-#         return response.text
+            response.raise_for_status()
 
 class GeminiClient:
 
     @staticmethod
-    async def send_message_to_gemini(message: str, history: list) -> str:
+    async def send_message_to_gemini(user_input: str, message: str, history: list) -> str:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
         headers = {
             "Content-Type": "application/json"
         }
 
-        history.append(
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": user_input
+                    }
+                ]
+            }
+        ] + history + \
+        [
             {
                 "role": "user",
                 "parts": [
@@ -197,17 +178,45 @@ class GeminiClient:
                     }
                 ]
             }
-        )
+        ]
 
         payload = {
-            "contents": history
+            "contents": contents
         }
 
-        async with httpx.AsyncClient() as client:
+        async with HttpxClient() as client:
             response = await client.post(url, headers=headers, json=payload)
-            response = response.json()
+            response.raise_for_status()    
 
-            if response.get('error'):
-                raise RuntimeError(response.get('error'))
-            else:
-                return response.get('candidates')[0].get('content').get('parts')[0].get('text')
+            return response.json().get('candidates')[0].get('content').get('parts')[0].get('text')
+
+async def receive_and_respond_message(user_phone_id: str, client_phone_number: str, client_message: str) -> None:
+    dynamo_db_client = DynamoDBClient(user_phone_id, client_phone_number)
+    whatsapp_client = WhatsAppClient(user_phone_id, client_phone_number)
+    gemini_client = GeminiClient()
+
+    await dynamo_db_client.init_client()
+
+    history, (user_input, whatsapp_access_token) = await asyncio.gather(
+        dynamo_db_client.get_chat_history(),
+        dynamo_db_client.get_user_data()
+    )
+
+    gemini_response = await gemini_client.send_message_to_gemini(
+        message = client_message,
+        history = history,
+        user_input = user_input
+    )
+
+    await asyncio.gather(
+        whatsapp_client.send_message_to_whatsapp(
+            message = gemini_response,
+            whatsapp_access_token = whatsapp_access_token
+        ),
+        dynamo_db_client.save_chat_history(
+            new_message = client_message,
+            new_response = gemini_response
+        )
+    )
+
+    await dynamo_db_client.close_client()
